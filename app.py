@@ -639,9 +639,10 @@ async def websocket_endpoint(websocket: WebSocket):
 # 4. Main Entry Point
 # ----------------------------------------------------
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
     print("\n" + "="*50)
     print("🚀 TikTok LIVE WebApp พร้อมใช้งานแล้ว!")
-    print("👉 เปิดเว็บเบราว์เซอร์ไปที่: http://127.0.0.1:8000")
+    print(f"👉 เปิดเว็บเบราว์เซอร์ไปที่: http://127.0.0.1:{port}")
     print("="*50 + "\n")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
     
