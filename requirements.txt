@@ -55,7 +55,7 @@ MarkupSafe==3.0.2
 mashumaro==3.23
 matplotlib==3.10.6
 mdurl==0.1.2
-mediapipe==0.10.21
+mediapipe>=0.10.30
 ml_dtypes==0.5.3
 moviepy==1.0.3
 multidict==7.1.0
