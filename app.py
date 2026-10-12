@@ -1,12 +1,16 @@
 import os
 import sys
+import re
 import json
 import logging
 import asyncio
+import io
+from urllib.parse import quote
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse, Response
 import uvicorn
+from gtts import gTTS
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import CommentEvent, ConnectEvent, GiftEvent, RoomUserSeqEvent
 
@@ -46,7 +50,7 @@ sys.stderr = SuppressWebcastErrorFilter(sys.stderr)
 # ----------------------------------------------------
 # 2. FastAPI Backend & TikTok Connection Manager
 # ----------------------------------------------------
-app = FastAPI(title="TikTok LIVE Web Dashboard")
+app = FastAPI(title="TikTok LIVE Web Dashboard with gTTS")
 
 class ConnectionManager:
     def __init__(self):
@@ -56,10 +60,8 @@ class ConnectionManager:
         self.active_user = ""
         self.current_task: asyncio.Task = None
 
-        # ที่เก็บประวัติบัญชี
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.history_file = os.path.join(self.base_dir, "account_history.json")
-        self.config_file = os.path.join(self.base_dir, "config.json")
 
     def load_history(self):
         if os.path.exists(self.history_file):
@@ -85,32 +87,12 @@ class ConnectionManager:
         except Exception:
             pass
 
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
-
-    def save_config(self, api_key: str):
-        try:
-            cfg = self.load_config()
-            cfg["sign_api_key"] = api_key.strip()
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_websockets.add(websocket)
-        # ส่งข้อมูลเริ่มต้นเมื่อ Client ต่อเข้ามา
         init_data = {
             "type": "init",
             "history": self.load_history(),
-            "sign_api_key": self.load_config().get("sign_api_key", ""),
             "is_running": self.is_running,
             "active_user": self.active_user
         }
@@ -126,12 +108,11 @@ class ConnectionManager:
             except Exception:
                 self.active_websockets.discard(ws)
 
-    async def start_tiktok(self, username: str, api_key: str):
+    async def start_tiktok(self, username: str):
         await self.stop_tiktok()
 
         username = username.strip().replace("@", "")
         self.save_history(username)
-        self.save_config(api_key)
 
         self.is_running = True
         self.active_user = username
@@ -139,11 +120,7 @@ class ConnectionManager:
         await self.broadcast({"type": "status", "status": "running", "username": username})
         await self.broadcast({"type": "log", "text": f"🔄 กำลังเชื่อมต่อไปยังห้อง LIVE ของ '{username}'..."})
 
-        client_kwargs = {"unique_id": username}
-        if api_key:
-            client_kwargs["sign_api_key"] = api_key
-
-        self.client = TikTokLiveClient(**client_kwargs)
+        self.client = TikTokLiveClient(unique_id=username)
 
         if hasattr(self.client, "logger"):
             self.client.logger.setLevel(logging.CRITICAL)
@@ -224,8 +201,29 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+
 # ----------------------------------------------------
-# 3. HTML + CSS + JS Frontend Template
+# 3. API แปลงข้อความเป็นเสียง gTTS (ตัด [ ] ออกอัตโนมัติ)
+# ----------------------------------------------------
+def generate_gtts_audio(text: str) -> bytes:
+    tts = gTTS(text=text, lang="th", slow=False)
+    buffer = io.BytesIO()
+    tts.write_to_fp(buffer)
+    buffer.seek(0)
+    return buffer.read()
+
+@app.get("/api/tts")
+async def get_gtts_audio(text: str = Query(..., max_length=400)):
+    cleaned = re.sub(r"http\S+|www\S+", "", text)
+    cleaned = re.sub(r"\[.*?\]", "", cleaned).strip()
+    if not cleaned:
+        return Response(status_code=400)
+    audio_bytes = await asyncio.to_thread(generate_gtts_audio, cleaned)
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
+# ----------------------------------------------------
+# 4. HTML + CSS + JS Frontend Template (Sarabun Font)
 # ----------------------------------------------------
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -233,7 +231,7 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TikTok LIVE Real-time Dashboard & TTS</title>
+    <title>TikTok LIVE Real-time Dashboard & gTTS</title>
     <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         * {
@@ -247,108 +245,125 @@ HTML_CONTENT = """
             color: #f8fafc;
             display: flex;
             justify-content: center;
-            padding: 20px;
+            padding: 16px;
         }
         .container {
             width: 100%;
-            max-width: 900px;
+            max-width: 860px;
             background: #1e293b;
-            border-radius: 16px;
-            padding: 24px;
+            border-radius: 14px;
+            padding: 20px;
             box-shadow: 0 10px 25px rgba(0,0,0,0.4);
         }
         h1 {
             text-align: center;
-            font-size: 26px;
+            font-size: 21px;
             font-weight: 700;
-            margin-bottom: 20px;
+            margin-bottom: 16px;
             color: #38bdf8;
         }
         .card {
             background: #0f172a;
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 16px;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 14px;
             border: 1px solid #334155;
         }
         .form-row {
             display: flex;
             align-items: center;
-            margin-bottom: 12px;
-            gap: 12px;
+            margin-bottom: 10px;
+            gap: 10px;
         }
         .form-row label {
-            width: 140px;
+            width: 120px;
             font-weight: 600;
-            font-size: 16px;
+            font-size: 13px;
             color: #cbd5e1;
         }
         .form-row input, .form-row select {
             flex: 1;
-            padding: 10px 14px;
-            border-radius: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
             border: 1px solid #475569;
             background: #1e293b;
             color: #fff;
-            font-size: 16px;
+            font-size: 13px;
             outline: none;
         }
         .form-row input:focus, .form-row select:focus {
             border-color: #38bdf8;
         }
+        .slider-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .slider-container input[type="range"] {
+            flex: 1;
+            accent-color: #38bdf8;
+            cursor: pointer;
+        }
+        .slider-val {
+            width: 45px;
+            font-weight: 600;
+            font-size: 13px;
+            color: #38bdf8;
+        }
         .options-group {
             display: flex;
             flex-wrap: wrap;
-            gap: 20px;
+            gap: 16px;
             margin-top: 10px;
-            padding-left: 140px;
+            padding-left: 120px;
         }
         .checkbox-label {
             display: flex;
             align-items: center;
-            gap: 8px;
-            font-size: 15px;
+            gap: 6px;
+            font-size: 12px;
             cursor: pointer;
             user-select: none;
         }
         .checkbox-label input {
-            width: 18px;
-            height: 18px;
+            width: 15px;
+            height: 15px;
             accent-color: #0284c7;
             cursor: pointer;
         }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-            margin-bottom: 16px;
+            gap: 10px;
+            margin-bottom: 14px;
         }
         .stat-card {
             background: #0f172a;
             border: 1px solid #334155;
-            border-radius: 12px;
-            padding: 14px;
+            border-radius: 10px;
+            padding: 12px;
             text-align: center;
         }
         .stat-title {
-            font-size: 14px;
+            font-size: 11px;
             color: #94a3b8;
             margin-bottom: 4px;
         }
         .stat-value {
-            font-size: 28px;
+            font-size: 22px;
             font-weight: 700;
         }
         .btn-action {
             width: 100%;
-            padding: 14px;
-            border-radius: 10px;
+            padding: 11px;
+            border-radius: 8px;
             border: none;
-            font-size: 18px;
+            font-size: 14px;
             font-weight: 700;
             cursor: pointer;
             transition: all 0.2s;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
         }
         .btn-start {
             background: #0284c7;
@@ -366,22 +381,22 @@ HTML_CONTENT = """
         }
         .log-box {
             background: #090d16;
-            border-radius: 12px;
+            border-radius: 10px;
             border: 1px solid #334155;
-            height: 380px;
+            height: 400px;
             overflow-y: auto;
             padding: 14px;
-            font-size: 16px;
+            font-size: 18px;
             line-height: 1.6;
         }
         .log-line {
-            margin-bottom: 6px;
+            margin-bottom: 8px;
             word-break: break-word;
         }
         .log-time {
             color: #64748b;
             font-size: 13px;
-            margin-right: 6px;
+            margin-right: 8px;
         }
         .comment-user {
             color: #38bdf8;
@@ -395,7 +410,7 @@ HTML_CONTENT = """
 </head>
 <body>
     <div class="container">
-        <h1>TikTok LIVE Real-time Dashboard & TTS</h1>
+        <h1>TikTok LIVE Comment Reader v1.0</h1>
 
         <!-- Settings Card -->
         <div class="card">
@@ -404,22 +419,24 @@ HTML_CONTENT = """
                 <input type="text" id="usernameInput" list="historyList" placeholder="เช่น mosfet1234 (ไม่ต้องใส่ @)">
                 <datalist id="historyList"></datalist>
             </div>
+
             <div class="form-row">
-                <label for="apiKeyInput">Sign API Key:</label>
-                <input type="text" id="apiKeyInput" placeholder="EulerStream API Key (เว้นว่างได้)">
+                <label for="speedRange">ความเร็วเสียง:</label>
+                <div class="slider-container">
+                    <input type="range" id="speedRange" min="0.8" max="1.8" step="0.1" value="1.1">
+                    <span class="slider-val" id="speedValText">1.1x</span>
+                </div>
             </div>
+
             <div class="options-group">
                 <label class="checkbox-label">
-                    <input type="checkbox" id="chkTTS" checked> เปิดเสียงอ่าน TTS (ไทย)
+                    <input type="checkbox" id="chkTTS" checked> เปิดเสียงอ่าน gTTS (ไทย)
                 </label>
                 <label class="checkbox-label">
                     <input type="checkbox" id="chkGiftSound" checked> เสียงเตือนของขวัญ
                 </label>
                 <label class="checkbox-label">
                     <input type="checkbox" id="chkReadName"> อ่านชื่อคนส่งนำหน้า
-                </label>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="chkReadBrackets"> อ่านข้อความใน [ ]
                 </label>
             </div>
         </div>
@@ -440,10 +457,8 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Toggle Button -->
         <button id="btnToggle" class="btn-action btn-start">Start Running</button>
 
-        <!-- Log Area -->
         <div class="log-box" id="logBox"></div>
     </div>
 
@@ -453,7 +468,58 @@ HTML_CONTENT = """
         let totalComments = 0;
         let totalGifts = 0;
 
-        // Web Audio Context สำหรับสังเคราะห์เสียง Chime
+        const speedRange = document.getElementById("speedRange");
+        const speedValText = document.getElementById("speedValText");
+        speedRange.addEventListener("input", (e) => {
+            speedValText.innerText = `${e.target.value}x`;
+        });
+
+        // คิวเสียง gTTS ป้องกันเสียงพูดซ้อนกัน
+        const audioQueue = [];
+        let isPlayingAudio = false;
+
+        function playNextInQueue() {
+            if (audioQueue.length === 0) {
+                isPlayingAudio = false;
+                return;
+            }
+            isPlayingAudio = true;
+            const text = audioQueue.shift();
+            const playbackRate = parseFloat(speedRange.value) || 1.1;
+
+            const audio = new Audio(`/api/tts?text=${encodeURIComponent(text)}`);
+            audio.playbackRate = playbackRate;
+
+            audio.onended = () => {
+                playNextInQueue();
+            };
+            audio.onerror = () => {
+                playNextInQueue();
+            };
+            audio.play().catch(() => {
+                playNextInQueue();
+            });
+        }
+
+        function speakGoogleTTS(text) {
+            if (!document.getElementById("chkTTS").checked) return;
+
+            let cleaned = text.replace(/https?:\/\/\S+/g, '');
+            cleaned = cleaned.replace(/\[.*?\]/g, '').trim();
+            if (!cleaned) return;
+
+            if (audioQueue.length >= 6) {
+                audioQueue.shift();
+            }
+
+            audioQueue.push(cleaned);
+
+            if (!isPlayingAudio) {
+                playNextInQueue();
+            }
+        }
+
+        // Web Audio Context สำหรับสังเคราะห์เสียง Chime ของขวัญ
         let audioCtx = null;
         function playGiftChime() {
             if (!document.getElementById("chkGiftSound").checked) return;
@@ -480,29 +546,6 @@ HTML_CONTENT = """
             } catch(e) {}
         }
 
-        // Web Speech API สำหรับอ่านออกเสียงภาษาไทย
-        function speakThai(text) {
-            if (!document.getElementById("chkTTS").checked) return;
-            if (!('speechSynthesis' in window)) return;
-
-            let cleaned = text.replace(/https?:\/\/\S+/g, '');
-            if (!document.getElementById("chkReadBrackets").checked) {
-                cleaned = cleaned.replace(/\[.*?\]/g, '');
-            } else {
-                cleaned = cleaned.replace(/[\[\]]/g, ' ');
-            }
-            cleaned = cleaned.trim();
-            if (!cleaned) return;
-
-            const utterance = new SpeechSynthesisUtterance(cleaned.substring(0, 40));
-            utterance.lang = "th-TH";
-            utterance.rate = 1.1; // ความเร็วเล็กน้อยให้ทันสตรีม
-
-            // ให้เสียงล่าสุดแทรกพูดทันที
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(utterance);
-        }
-
         function appendLog(htmlContent) {
             const logBox = document.getElementById("logBox");
             const now = new Date();
@@ -520,7 +563,7 @@ HTML_CONTENT = """
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                
+
                 if (data.type === "init") {
                     const dl = document.getElementById("historyList");
                     dl.innerHTML = "";
@@ -531,9 +574,6 @@ HTML_CONTENT = """
                     });
                     if (data.history.length > 0) {
                         document.getElementById("usernameInput").value = data.history[0];
-                    }
-                    if (data.sign_api_key) {
-                        document.getElementById("apiKeyInput").value = data.sign_api_key;
                     }
                     if (data.is_running) {
                         setRunningUI(true);
@@ -550,8 +590,8 @@ HTML_CONTENT = """
                     appendLog(`<span class="comment-user">💬 ${data.user}:</span> ${data.comment}`);
 
                     const toSpeak = document.getElementById("chkReadName").checked ? 
-                                    `${data.user.substring(0, 8)} ${data.comment}` : data.comment;
-                    speakThai(toSpeak);
+                                    `${data.user} ${data.comment}` : data.comment;
+                    speakGoogleTTS(toSpeak);
                 } else if (data.type === "gift") {
                     totalGifts += data.count;
                     document.getElementById("valGifts").innerText = totalGifts.toLocaleString();
@@ -569,25 +609,21 @@ HTML_CONTENT = """
             isRunning = running;
             const btn = document.getElementById("btnToggle");
             const userInput = document.getElementById("usernameInput");
-            const apiInput = document.getElementById("apiKeyInput");
 
             if (isRunning) {
                 btn.innerText = "Stop";
                 btn.className = "btn-action btn-stop";
                 userInput.disabled = true;
-                apiInput.disabled = true;
             } else {
                 btn.innerText = "Start Running";
                 btn.className = "btn-action btn-start";
                 userInput.disabled = false;
-                apiInput.disabled = false;
             }
         }
 
         document.getElementById("btnToggle").addEventListener("click", () => {
             if (!isRunning) {
                 const user = document.getElementById("usernameInput").value.trim();
-                const key = document.getElementById("apiKeyInput").value.trim();
                 if (!user) {
                     alert("กรุณากรอก TikTok Username");
                     return;
@@ -600,15 +636,13 @@ HTML_CONTENT = """
 
                 ws.send(JSON.stringify({
                     action: "start",
-                    username: user,
-                    api_key: key
+                    username: user
                 }));
             } else {
                 ws.send(JSON.stringify({ action: "stop" }));
             }
         });
 
-        // เชื่อมต่อเมื่อเปิดหน้าเว็บ
         connectWebSocket();
     </script>
 </body>
@@ -627,7 +661,7 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_json()
             action = data.get("action")
             if action == "start":
-                await manager.start_tiktok(data.get("username", ""), data.get("api_key", ""))
+                await manager.start_tiktok(data.get("username", ""))
             elif action == "stop":
                 await manager.stop_tiktok()
     except WebSocketDisconnect:
@@ -636,12 +670,12 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 # ----------------------------------------------------
-# 4. Main Entry Point
+# 5. Main Entry Point
 # ----------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print("\n" + "="*50)
-    print("🚀 TikTok LIVE WebApp พร้อมใช้งานแล้ว!")
+    print("🚀 TikTok LIVE WebApp (gTTS Version) พร้อมใช้งานแล้ว!")
     print(f"👉 เปิดเว็บเบราว์เซอร์ไปที่: http://127.0.0.1:{port}")
     print("="*50 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
