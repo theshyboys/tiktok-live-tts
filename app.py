@@ -5,7 +5,6 @@ import json
 import logging
 import asyncio
 import io
-from urllib.parse import quote
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, Response
@@ -48,77 +47,37 @@ sys.stderr = SuppressWebcastErrorFilter(sys.stderr)
 
 
 # ----------------------------------------------------
-# 2. FastAPI Backend & TikTok Connection Manager
+# 2. Session Worker: คุม 1 TikTok Client ต่อ 1 Browser
 # ----------------------------------------------------
-app = FastAPI(title="TikTok LIVE Web Dashboard with gTTS")
+app = FastAPI(title="TikTok LIVE Multi-User Dashboard with gTTS")
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_websockets: set[WebSocket] = set()
+class UserLiveSession:
+    """จัดการ Session ของแต่ละ Browser แยกอิสระ"""
+    def __init__(self, websocket: WebSocket):
+        self.ws = websocket
         self.client: TikTokLiveClient = None
+        self.task: asyncio.Task = None
         self.is_running = False
         self.active_user = ""
-        self.current_task: asyncio.Task = None
 
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.history_file = os.path.join(self.base_dir, "account_history.json")
-
-    def load_history(self):
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return ["mosfet1234"]
-
-    def save_history(self, username: str):
-        username = username.strip().replace("@", "")
-        if not username:
-            return
-        history = self.load_history()
-        if username in history:
-            history.remove(username)
-        history.insert(0, username)
-        history = history[:15]
+    async def send_msg(self, message: dict):
         try:
-            with open(self.history_file, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+            await self.ws.send_json(message)
         except Exception:
             pass
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_websockets.add(websocket)
-        init_data = {
-            "type": "init",
-            "history": self.load_history(),
-            "is_running": self.is_running,
-            "active_user": self.active_user
-        }
-        await websocket.send_json(init_data)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_websockets.discard(websocket)
-
-    async def broadcast(self, message: dict):
-        for ws in list(self.active_websockets):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                self.active_websockets.discard(ws)
-
-    async def start_tiktok(self, username: str):
-        await self.stop_tiktok()
+    async def start(self, username: str):
+        await self.stop()
 
         username = username.strip().replace("@", "")
-        self.save_history(username)
+        if not username:
+            return
 
         self.is_running = True
         self.active_user = username
 
-        await self.broadcast({"type": "status", "status": "running", "username": username})
-        await self.broadcast({"type": "log", "text": f"🔄 กำลังเชื่อมต่อไปยังห้อง LIVE ของ '{username}'..."})
+        await self.send_msg({"type": "status", "status": "running", "username": username})
+        await self.send_msg({"type": "log", "text": f"🔄 กำลังเชื่อมต่อไปยังห้อง LIVE ของ '{username}'..."})
 
         self.client = TikTokLiveClient(unique_id=username)
 
@@ -131,21 +90,21 @@ class ConnectionManager:
         async def on_connect(event: ConnectEvent):
             if not self.is_running or self.active_user != username:
                 return
-            await self.broadcast({"type": "log", "text": f"🟢 เกาะห้อง LIVE สำเร็จแล้ว! (Room ID: {self.client.room_id})"})
+            await self.send_msg({"type": "log", "text": f"🟢 เกาะห้อง LIVE สำเร็จแล้ว! (Room ID: {self.client.room_id})"})
 
         @self.client.on(RoomUserSeqEvent)
         async def on_user_seq(event: RoomUserSeqEvent):
             if not self.is_running or self.active_user != username:
                 return
             viewers = getattr(event, "total", 0)
-            await self.broadcast({"type": "stat_viewers", "count": viewers})
+            await self.send_msg({"type": "stat_viewers", "count": viewers})
 
         @self.client.on(CommentEvent)
         async def on_comment(event: CommentEvent):
             if not self.is_running or self.active_user != username:
                 return
             user_name = event.user.nickname or event.user.unique_id
-            await self.broadcast({
+            await self.send_msg({
                 "type": "comment",
                 "user": user_name,
                 "comment": event.comment
@@ -164,7 +123,7 @@ class ConnectionManager:
                 gift_count = getattr(event.gift, "count", 1)
                 user_name = event.user.nickname or event.user.unique_id
 
-                await self.broadcast({
+                await self.send_msg({
                     "type": "gift",
                     "user": user_name,
                     "gift_name": gift_name,
@@ -176,12 +135,12 @@ class ConnectionManager:
                 await self.client.connect()
             except Exception as e:
                 if self.is_running and self.active_user == username:
-                    await self.broadcast({"type": "log", "text": f"❌ หลุดจากการเชื่อมต่อ: {e}"})
-                    await self.stop_tiktok()
+                    await self.send_msg({"type": "log", "text": f"❌ หลุดจากการเชื่อมต่อ: {e}"})
+                    await self.stop()
 
-        self.current_task = asyncio.create_task(runner())
+        self.task = asyncio.create_task(runner())
 
-    async def stop_tiktok(self):
+    async def stop(self):
         self.is_running = False
         self.active_user = ""
         if self.client:
@@ -191,19 +150,16 @@ class ConnectionManager:
                 pass
             self.client = None
 
-        if self.current_task and not self.current_task.done():
-            self.current_task.cancel()
-            self.current_task = None
+        if self.task and not self.task.done():
+            self.task.cancel()
+            self.task = None
 
-        await self.broadcast({"type": "status", "status": "stopped"})
-        await self.broadcast({"type": "log", "text": "✅ หยุดการทำงานเรียบร้อย"})
-
-
-manager = ConnectionManager()
+        await self.send_msg({"type": "status", "status": "stopped"})
+        await self.send_msg({"type": "log", "text": "✅ หยุดการทำงานเรียบร้อย"})
 
 
 # ----------------------------------------------------
-# 3. API แปลงข้อความเป็นเสียง gTTS (ตัด [ ] ออกอัตโนมัติ)
+# 3. API แปลงข้อความเป็นเสียง gTTS
 # ----------------------------------------------------
 def generate_gtts_audio(text: str) -> bytes:
     tts = gTTS(text=text, lang="th", slow=False)
@@ -223,7 +179,7 @@ async def get_gtts_audio(text: str = Query(..., max_length=400)):
 
 
 # ----------------------------------------------------
-# 4. HTML + CSS + JS Frontend Template (Sarabun Font)
+# 4. HTML Frontend Template (พร้อม TikTok Credit Link & SVG Icon)
 # ----------------------------------------------------
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -406,13 +362,47 @@ HTML_CONTENT = """
             color: #f43f5e;
             font-weight: 600;
         }
+
+        /* --- Footer Credit --- */
+        .footer-credit {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            margin-top: 16px;
+            font-size: 13px;
+            color: #94a3b8;
+        }
+        .footer-credit a {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #f8fafc;
+            text-decoration: none;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            transition: all 0.2s ease;
+        }
+        .footer-credit a:hover {
+            color: #38bdf8;
+            border-color: #38bdf8;
+            background: #1e293b;
+            transform: translateY(-1px);
+        }
+        .tiktok-icon {
+            width: 15px;
+            height: 15px;
+            fill: currentColor;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>TikTok LIVE Comment Reader v1.0</h1>
 
-        <!-- Settings Card -->
         <div class="card">
             <div class="form-row">
                 <label for="usernameInput">Username:</label>
@@ -441,7 +431,6 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Dashboard Stats -->
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-title">ผู้ชมปัจจุบัน</div>
@@ -460,6 +449,17 @@ HTML_CONTENT = """
         <button id="btnToggle" class="btn-action btn-start">Start Running</button>
 
         <div class="log-box" id="logBox"></div>
+
+        <!-- เครดิต TikTok พร้อมไอคอน -->
+        <div class="footer-credit">
+            <span>Created by</span>
+            <a href="https://www.tiktok.com/@mosfet1234" target="_blank" rel="noopener noreferrer">
+                <svg class="tiktok-icon" viewBox="0 0 448 512">
+                    <path d="M448,209.91a210.06,210.06,0,0,1-122.77-39.25V349.38A162.55,162.55,0,1,1,185,188.31V278.2a74.62,74.62,0,1,0,52.23,71.18V0l88,0a121.18,121.18,0,0,0,1.86,22.17h0A122.18,122.18,0,0,0,381,102.39a121.43,121.43,0,0,0,67,20.14Z"/>
+                </svg>
+                <span>@mosfet1234</span>
+            </a>
+        </div>
     </div>
 
     <script>
@@ -474,7 +474,37 @@ HTML_CONTENT = """
             speedValText.innerText = `${e.target.value}x`;
         });
 
-        // คิวเสียง gTTS ป้องกันเสียงพูดซ้อนกัน
+        // จัดการประวัติ Username แยกตามเครื่องด้วย LocalStorage
+        function loadLocalHistory() {
+            try {
+                const history = JSON.parse(localStorage.getItem("tiktok_history") || '["mosfet1234"]');
+                const dl = document.getElementById("historyList");
+                dl.innerHTML = "";
+                history.forEach(u => {
+                    const opt = document.createElement("option");
+                    opt.value = u;
+                    dl.appendChild(opt);
+                });
+                if (history.length > 0 && !document.getElementById("usernameInput").value) {
+                    document.getElementById("usernameInput").value = history[0];
+                }
+            } catch(e) {}
+        }
+
+        function saveLocalHistory(username) {
+            try {
+                let history = JSON.parse(localStorage.getItem("tiktok_history") || '["mosfet1234"]');
+                history = history.filter(u => u !== username);
+                history.unshift(username);
+                history = history.slice(0, 15);
+                localStorage.setItem("tiktok_history", JSON.stringify(history));
+                loadLocalHistory();
+            } catch(e) {}
+        }
+
+        loadLocalHistory();
+
+        // คิวเสียง gTTS
         const audioQueue = [];
         let isPlayingAudio = false;
 
@@ -490,15 +520,9 @@ HTML_CONTENT = """
             const audio = new Audio(`/api/tts?text=${encodeURIComponent(text)}`);
             audio.playbackRate = playbackRate;
 
-            audio.onended = () => {
-                playNextInQueue();
-            };
-            audio.onerror = () => {
-                playNextInQueue();
-            };
-            audio.play().catch(() => {
-                playNextInQueue();
-            });
+            audio.onended = () => { playNextInQueue(); };
+            audio.onerror = () => { playNextInQueue(); };
+            audio.play().catch(() => { playNextInQueue(); });
         }
 
         function speakGoogleTTS(text) {
@@ -511,7 +535,6 @@ HTML_CONTENT = """
             if (audioQueue.length >= 6) {
                 audioQueue.shift();
             }
-
             audioQueue.push(cleaned);
 
             if (!isPlayingAudio) {
@@ -519,7 +542,7 @@ HTML_CONTENT = """
             }
         }
 
-        // Web Audio Context สำหรับสังเคราะห์เสียง Chime ของขวัญ
+        // Web Audio Context สำหรับเสียง Chime
         let audioCtx = null;
         function playGiftChime() {
             if (!document.getElementById("chkGiftSound").checked) return;
@@ -564,21 +587,7 @@ HTML_CONTENT = """
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
 
-                if (data.type === "init") {
-                    const dl = document.getElementById("historyList");
-                    dl.innerHTML = "";
-                    data.history.forEach(u => {
-                        const opt = document.createElement("option");
-                        opt.value = u;
-                        dl.appendChild(opt);
-                    });
-                    if (data.history.length > 0) {
-                        document.getElementById("usernameInput").value = data.history[0];
-                    }
-                    if (data.is_running) {
-                        setRunningUI(true);
-                    }
-                } else if (data.type === "status") {
+                if (data.type === "status") {
                     setRunningUI(data.status === "running");
                 } else if (data.type === "log") {
                     appendLog(data.text);
@@ -628,6 +637,8 @@ HTML_CONTENT = """
                     alert("กรุณากรอก TikTok Username");
                     return;
                 }
+                saveLocalHistory(user);
+
                 totalComments = 0;
                 totalGifts = 0;
                 document.getElementById("valComments").innerText = "0";
@@ -655,19 +666,20 @@ async def get_index():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
+    session = UserLiveSession(websocket)
     try:
         while True:
             data = await websocket.receive_json()
             action = data.get("action")
             if action == "start":
-                await manager.start_tiktok(data.get("username", ""))
+                await session.start(data.get("username", ""))
             elif action == "stop":
-                await manager.stop_tiktok()
+                await session.stop()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await session.stop()
     except Exception:
-        manager.disconnect(websocket)
+        await session.stop()
 
 # ----------------------------------------------------
 # 5. Main Entry Point
@@ -675,7 +687,7 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print("\n" + "="*50)
-    print("🚀 TikTok LIVE WebApp (gTTS Version) พร้อมใช้งานแล้ว!")
+    print("🚀 TikTok LIVE Multi-Session WebApp พร้อมใช้งานแล้ว!")
     print(f"👉 เปิดเว็บเบราว์เซอร์ไปที่: http://127.0.0.1:{port}")
     print("="*50 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
